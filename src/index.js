@@ -8,7 +8,9 @@ const {
   log,
   errors,
   cozyClient,
-  updateOrCreate
+  updateOrCreate,
+  saveFiles,
+  saveBills
 } = require('cozy-konnector-libs')
 const moment = require('moment')
 const doctypes = require('cozy-doctypes')
@@ -35,6 +37,7 @@ const request = requestFactory({
   userAgent: true
 })
 
+const VENDOR = 'Nalo'
 const baseApiUrl = 'https://nalo.fr/api/v1'
 
 module.exports = new BaseKonnector(start)
@@ -45,6 +48,9 @@ async function start(fields, cozyParameters) {
   if (cozyParameters) log('debug', 'Found COZY_PARAMETERS')
   const userToken = await authenticate(fields.login, fields.password)
   log('info', 'Successfully logged in')
+
+  log('info', 'Retrieve documents')
+  await retrieveDocuments(userToken, fields)
 
   log('info', 'Retrieving details of bank accounts')
   const bankAccounts = await getBankAccounts(userToken)
@@ -79,6 +85,168 @@ function authenticate(username, password) {
       log('error', $.error.detail)
       throw new Error(errors.LOGIN_FAILED)
     })
+}
+
+// List and retrieve all available documents
+async function retrieveDocuments(userToken, fields) {
+  // Retrieve list of signed documents
+  const contractDocs = await request(
+    `${baseApiUrl}/profiles/me/signed-documents/`,
+    {
+      headers: {
+        Authorization: 'Token ' + userToken
+      }
+    }
+  )
+    .then($ => {
+      return $.detail
+    })
+    .catch($ => {
+      log('error', $.error)
+      throw new Error(errors.VENDOR_DOWN)
+    })
+
+  // Retrieve each signed document
+  let docs = []
+  for (let doc of contractDocs) {
+    const file = await request(
+      `${baseApiUrl}/profiles/me/signed-document-content/${doc.id}`,
+      {
+        headers: {
+          Authorization: 'Token ' + userToken
+        },
+        cheerio: false,
+        json: true
+      }
+    )
+      .then($ => {
+        return $.detail
+      })
+      .catch($ => {
+        log('error', $.error)
+        throw new Error(errors.VENDOR_DOWN)
+      })
+
+    docs.push({
+      filename: file.filename,
+      filestream: Buffer.from(file.data, 'base64'),
+      vendor: VENDOR,
+      metadata: {
+        importDate: new Date(),
+        version: 1
+      }
+    })
+  }
+
+  // Save signed documents
+  await saveFiles(docs, fields, {
+    contentType: 'application/pdf'
+  })
+
+  // Retrieve list of transactional documents
+  const transactionalDocs = await request(
+    `${baseApiUrl}/account/transactional-pdfs`,
+    {
+      headers: {
+        Authorization: 'Token ' + userToken
+      }
+    }
+  )
+    .then($ => {
+      return $.detail
+    })
+    .catch($ => {
+      log('error', $.error)
+      throw new Error(errors.VENDOR_DOWN)
+    })
+
+  // Retrieve each transactional document
+  docs = []
+  for (let doc of transactionalDocs) {
+    const file = await request(
+      `${baseApiUrl}/contract/get-document/${doc.contract_id}/${doc.id_operation}`,
+      {
+        headers: {
+          Authorization: 'Token ' + userToken
+        },
+        cheerio: false,
+        json: true
+      }
+    )
+      .then($ => {
+        return $.detail
+      })
+      .catch($ => {
+        log('error', $.error)
+        throw new Error(errors.VENDOR_DOWN)
+      })
+
+    docs.push({
+      filename: file.filename,
+      filestream: Buffer.from(file.data, 'base64'),
+      vendor: VENDOR,
+      metadata: {
+        importDate: new Date(),
+        version: 1
+      }
+    })
+  }
+
+  // Save transactional documents
+  await saveBills(docs, fields, {
+    // This is a bank identifier which will be used to link bills to bank operations. These
+    // identifiers should be at least a word found in the title of a bank operation related to this
+    // bill. It is not case sensitive.
+    identifiers: ['generali vie'],
+    contentType: 'application/pdf',
+    processPdf: parseAmountAndDate
+  })
+}
+
+// Parse PDF in order to retrieve invoice amount and date
+function parseAmountAndDate(entry, text) {
+  const lines = text.split('\n')
+
+  // Check if PDF is an invoice for a transfer
+  const transferLines = lines
+    .map(line => line.match(/^Versement complémentaire$/))
+    .filter(Boolean)
+  if (transferLines.length === 0) {
+    log('debug', 'Not a transfer invoice')
+    entry.__ignore = true
+    return entry
+  }
+
+  // Find date in PDF
+  const dateLines = lines
+    .map(line => line.match(/^Paris,\s+le\s+(.*)$/))
+    .filter(Boolean)
+  if (dateLines.length === 0 || dateLines.length !== 1) {
+    log('warn', `No date or too many dates found (length=${dateLines.length}`)
+  } else {
+    entry.date = moment(dateLines[0][1], 'DD MMMM YYYY', 'fr').toDate()
+  }
+
+  // Find transfer amount in PDF
+  const amountLines = text.match(
+    /\s+Montant\n\s+brut\n\s+versé:\n\s+(.*)\n\s+Euros/
+  )
+  if (!amountLines || amountLines.length === 0 || amountLines.length !== 2) {
+    log(
+      'warn',
+      `No amount or too many amounts found (length=${
+        dateLines ? dateLines.length : 'null'
+      }`
+    )
+  } else {
+    entry.amount = normalizePrice(amountLines[1])
+  }
+
+  // TODO Find a way to set the correct filename based on the vendor, date, and
+  // amount. Setting it here will not be useful, as the file has already been
+  // saved by saveFiles at this point.
+
+  return entry
 }
 
 // Create Cozy bank accounts, see documentation on https://docs.cozy.io/en/cozy-doctypes/docs/io.cozy.bank/#iocozybankaccounts
@@ -130,4 +298,15 @@ async function saveBalances(accounts) {
   )
 
   return updateOrCreate(balances, 'io.cozy.bank.balancehistories', ['_id'])
+}
+
+// Convert a price string to a float
+function normalizePrice(price) {
+  // Replace ',' by '.' and remove extra white spaces for parseFloat
+  return parseFloat(
+    price
+      .replace(',', '.')
+      .replace(/\s/g, '')
+      .trim()
+  )
 }
