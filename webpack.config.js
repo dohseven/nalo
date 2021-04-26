@@ -43,7 +43,8 @@ module.exports = {
         { from: 'README.md' },
         { from: 'assets', transform: optimizeSVGIcon },
         { from: '.travis.yml' },
-        { from: 'LICENSE' }
+        { from: 'LICENSE' },
+        { from: 'node_modules/pdfjs-dist/build/pdf.worker.js' }
       ]
     }),
     new webpack.DefinePlugin({
